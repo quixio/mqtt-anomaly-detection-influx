@@ -5,41 +5,56 @@ from quixstreams import Application
 from dotenv import load_dotenv
 load_dotenv()
 
-app = Application(consumer_group="raw-to-table-v5", auto_offset_reset="earliest", use_changelog_topics=True)
+app = Application(
+    consumer_group="mqtt-norm-v1.2", 
+    auto_offset_reset="earliest")
 
-input_topic = app.topic(os.environ["input"])
+input_topic = app.topic(os.environ["input"], value_deserializer="bytes", key_deserializer="str")
 output_topic = app.topic(os.environ["output"])
+
 
 sdf = app.dataframe(input_topic)
 
-def expand_values_to_columns(message: dict):
+# Filter out keys that don't have the correct format.
+sdf = sdf.filter(lambda row, key, *_: key.startswith("MSU") and len(key.split("-")) == 6, metadata=True)
 
-    for row in message["payload"]:
+def expand_key(row, key, timestamp, headers):
+    
+    expanded_key = key.split("-")
+    sensor_id = f"{expanded_key[1]}-{expanded_key[2]}-{expanded_key[3]}"
+    
+    
 
+    result = {
+        "device_id": expanded_key[4],
+        "location": expanded_key[5],
+        "timestamp": timestamp
+    }
+    
+    value = bytes.decode(row)
+    
+    if isinstance(value, (int, float)):  # Check for number (integer or float)
+        result[sensor_id] =  float(value)
+    elif isinstance(value, str):  # Check for string
+        try:
+            # Attempt to parse the value as a number
+            parsed_value = float(value)
+            result[sensor_id] = float(parsed_value)
+        except (ValueError, TypeError):
+            # If parsing fails, assign as a string
+            result[sensor_id] = str(value)
+        
+    return result
 
-        new_row = {
-            "timestamp": row["time"],
-            "sessionId": message["sessionId"],
-            "deviceId": message["deviceId"]
-        }
+sdf = sdf.apply(expand_key, metadata=True)
+sdf = sdf.group_by("device_id")
+sdf = sdf.sliding_window(60000, 5000).reduce(lambda window, row: {**window, **row}, lambda row: row).final()
 
-        for key in row["values"]:
-            new_row[row["name"] + "-" + key] = row["values"][key]
+sdf = sdf.apply(lambda row: row["value"])
+sdf = sdf.drop("timestamp")
 
-        yield new_row
-
-sdf = sdf.apply(expand_values_to_columns, expand=True)
-
-sdf = sdf.hopping_window(5000, 250).reduce(lambda state, row: { **state, **row}, lambda row: row).final()
-
-sdf = sdf.apply(lambda row:{
-    "timestamp": row["start"],
-    **row["value"]
-})
-
-sdf = sdf.update(lambda row: print(row))
-
-sdf = sdf.to_topic(output_topic)
+sdf.print()
+sdf.to_topic(output_topic)
 
 if __name__ == "__main__":
-    app.run(sdf)
+    app.run()
